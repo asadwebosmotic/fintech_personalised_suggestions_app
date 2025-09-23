@@ -1,12 +1,8 @@
 '''two slms according to the daigram'''
 from pymongo import MongoClient
 from groq import Groq
-from pydantic import ValidationError
 import os, json
-from typing import List
 from dotenv import load_dotenv
-# === Import FinanceProfile Schema ===
-from static_templates import FinanceProfile  # put your class in finance_profile_schema.py
 
 load_dotenv()
 
@@ -20,64 +16,8 @@ finance_profiles_col = db["finance_profiles"]  # aggregated schema-validated pro
 # === Groq Client ===
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# --- SLM1: Convert raw profile -> FinanceProfile ---
-def process_with_slm1(raw_profile: dict) -> dict:
-    # 🔹 Reduce document size (keep only relevant fields + last N transactions)
-    raw_minimal = {
-        "user_id": raw_profile.get("user_id"),
-        "name": raw_profile.get("name"),
-        "dob": raw_profile.get("dob"),
-        "employment": raw_profile.get("employment"),
-        "accounts": [
-            {
-                "account_number": acc.get("account_number"),
-                "transactions": acc.get("transactions", [])  # only last 5 txns
-            }
-            for acc in raw_profile.get("accounts", [])
-        ]
-    }
-
-    schema_str = json.dumps(FinanceProfile.model_json_schema(), indent=2)
-
-
-    prompt = f"""
-    You are a data extraction assistant.
-
-    Task:
-    - Map the simplified user profile into the FinanceProfile schema below.
-    - Fill ONLY the fields that have direct matches in the input data.
-    - If a field has no value, completely omit it from the JSON (do not include null/empty).
-    - Output must be valid JSON only, with no explanations.
-
-    FinanceProfile Schema (for reference):
-    {schema_str}
-
-    Simplified profile:
-    {json.dumps(raw_minimal, indent=2, default=str)}
-
-    Return ONLY valid JSON matching the schema.
-    """
-
-    completion = groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-        max_tokens=1200  # cap output size
-    )
-
-
-    try:
-        parsed = json.loads(completion.choices[0].message.content)
-        # Validate with Pydantic schema
-        profile = FinanceProfile.model_validate(parsed)
-        return profile.model_dump(exclude_none=True)
-    except (json.JSONDecodeError, ValidationError) as e:
-        print("⚠️ Validation/Parsing failed:", e)
-        print("Raw response was:", completion.choices[0].message.content)
-        return None
-
-# --- SLM2: Analyze finance profiles -> Spending Patterns ---
-def analyze_with_slm2(force: bool = False) -> dict:
+# --- SLM: Analyze finance profiles -> Spending Patterns ---
+def analyze_with_slm(force: bool = False) -> dict:
     """Analyze raw user profiles one by one and append insights into finance_profiles collection."""
     results = {}
     raw_users = list(raw_profiles_col.find({}))
@@ -106,11 +46,11 @@ def analyze_with_slm2(force: bool = False) -> dict:
         2. Summarize insights across individual users.
         3. Keep the response clear and actionable.
 
-        Respond in natural language (not JSON).
+        Respond in natural language (JSON).
         """
         try:
             completion = groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",  # SLM2 (stronger reasoning than SLM1)
+                model="openai/gpt-oss-120b",  # SLM2 (stronger reasoning than SLM1)
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
                 max_tokens=600
@@ -137,56 +77,9 @@ def analyze_with_slm2(force: bool = False) -> dict:
 
     return results
 
-from decimal import Decimal
-
-def clean_for_mongo(doc: dict) -> dict:
-    """Recursively convert Decimal to float so MongoDB can store it."""
-    if isinstance(doc, dict):
-        return {k: clean_for_mongo(v) for k, v in doc.items()}
-    elif isinstance(doc, list):
-        return [clean_for_mongo(v) for v in doc]
-    elif isinstance(doc, Decimal):
-        return float(doc)
-    return doc
-
-# --- Pipeline Runner ---
-def run_pipeline():
-    raw_users = list(raw_profiles_col.find({}))
-    aggregated_profiles = []
-
-    for user in raw_users:
-        user_id = user.get("user_id")
-        print(f"🔎 Processing user_id: {user_id}")
-
-        # ✅ Skip if already exists in finance_profiles
-        if finance_profiles_col.find_one({"user_id": user_id}):
-            print(f"⏭️ Skipping {user_id}, already processed by SLM1.")
-            continue
-        processed = process_with_slm1(user)
-        if processed:
-            cleaned_doc = clean_for_mongo(processed)
-            finance_profiles_col.update_one(
-                {"user_id": user["user_id"]},
-                {"$set": cleaned_doc},
-                upsert=True
-            )
-            aggregated_profiles.append(cleaned_doc)
-
-    print("✅ All profiles processed & stored in finance_profiles.")
-
-    # Run SLM2 across all aggregated profiles
-        # If no new profiles, load all existing ones
-    if not aggregated_profiles:
-        aggregated_profiles = list(finance_profiles_col.find({}, {"_id": 0}))  # exclude _id for cleanliness
-
-    if aggregated_profiles:
-        insights = analyze_with_slm2(aggregated_profiles)
-        print("\n📊 Individual Spending Pattern Insights:")
-        for uid, analysis in insights.items():
-            print(f"\n--- {uid} ---\n{analysis or 'No analysis available'}")
-    else:
-        print("⚠️ No finance profiles available for analysis.")
-
 # --- Run main ---
 if __name__ == "__main__":
-    run_pipeline()
+    insights = analyze_with_slm()
+    print("\n📊 Individual Spending Pattern Insights:")
+    for uid, analysis in insights.items():
+        print(f"\n--- {uid} ---\n{analysis or 'No analysis available'}")
